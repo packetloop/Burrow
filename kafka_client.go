@@ -13,6 +13,8 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
+	"io/ioutil"
 	"encoding/binary"
 	"errors"
 	"github.com/Shopify/sarama"
@@ -49,7 +51,25 @@ func NewKafkaClient(app *ApplicationContext, cluster string) (*KafkaClient, erro
 	profile := app.Config.Clientprofile[app.Config.Kafka[cluster].Clientprofile]
 	clientConfig.ClientID = profile.ClientID
 	clientConfig.Net.TLS.Enable = profile.TLS
-	clientConfig.Net.TLS.Config = &tls.Config{}
+	if profile.TLSCertFilePath == "" || profile.TLSKeyFilePath == "" || profile.TLSCAFilePath == "" {
+		clientConfig.Net.TLS.Config = &tls.Config{}
+	} else {
+		caCert, err := ioutil.ReadFile(profile.TLSCAFilePath)
+		if err != nil {
+			return nil, err
+		}
+		cert, err := tls.LoadX509KeyPair(profile.TLSCertFilePath, profile.TLSKeyFilePath)
+		if err != nil {
+			return nil, err
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		clientConfig.Net.TLS.Config = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			RootCAs: caCertPool,
+		}
+		clientConfig.Net.TLS.Config.BuildNameToCertificate()
+	}
 	clientConfig.Net.TLS.Config.InsecureSkipVerify = profile.TLSNoVerify
 
 	sclient, err := sarama.NewClient(app.Config.Kafka[cluster].Brokers, clientConfig)
@@ -103,6 +123,7 @@ func NewKafkaClient(app *ApplicationContext, cluster string) (*KafkaClient, erro
 
 	// Now get the first set of offsets and start a goroutine to continually check them
 	client.getOffsets()
+	client.getConsumerOffsets()
 	client.brokerOffsetTicker = time.NewTicker(time.Duration(client.app.Config.Tickers.BrokerOffsets) * time.Second)
 	go func() {
 		for _ = range client.brokerOffsetTicker.C {
@@ -167,6 +188,114 @@ func timeoutSendOffset(offsetChannel chan *protocol.PartitionOffset, offset *pro
 	case offsetChannel <- offset:
 	case <-timeout:
 	}
+}
+
+func (client *KafkaClient) getConsumerOffsets() error {
+	requests := make(map[int32]*sarama.ListGroupsRequest)
+	brokers := make(map[int32]*sarama.Broker)
+
+	client.topicMapLock.RLock()
+
+	// for each broker, the groups that it manages
+	for topic, partitions := range client.topicMap {
+		for i := 0; i < partitions; i++ {
+			broker, err := client.client.Leader(topic, int32(i))
+			if err != nil {
+				client.topicMapLock.RUnlock()
+				log.Errorf("Topic leader error on %s:%v: %v", topic, int32(i), err)
+				return err
+			}
+			if _, ok := requests[broker.ID()]; !ok {
+				requests[broker.ID()] = &sarama.ListGroupsRequest{}
+			}
+			brokers[broker.ID()] = broker
+		}
+	}
+
+	// Send out the OffsetFetchRequest to each broker for all the partitions it is leader for
+	// The results go to the offset storage module
+	var wg sync.WaitGroup
+
+	fetchConsumerOffsets := func(brokerID int32, request *sarama.ListGroupsRequest) {
+		defer wg.Done()
+		response, err := brokers[brokerID].ListGroups(request)
+		if err != nil {
+			log.Errorf("Cannot fetch offsets from broker %v: %v", brokerID, err)
+			_ = brokers[brokerID].Close()
+			return
+		}
+
+		// for each group, fetch a description of it
+		for group, groupType := range response.Groups {
+			if groupType == "consumer" {
+				describeRequest := new(sarama.DescribeGroupsRequest)
+				describeRequest.AddGroup(group)
+
+				describeResponse, err := brokers[brokerID].DescribeGroups(describeRequest)
+				if err != nil {
+					log.Errorf("Cannot fetch consumer desc from broker %v: %v", brokerID, err)
+				} else {
+					for _, description := range describeResponse.Groups {
+						for _, member := range description.Members {
+							// sarama doesn't decode the description for us
+							// so we have imported and used some sarama decoding
+							// stuff to do it here.
+							pd := realDecoder { raw: member.MemberAssignment }
+							memberAssignment := new(ConsumerGroupMemberAssignment)
+							memberAssignment.decode(&pd)
+
+							for topic, partitions := range memberAssignment.Topics {
+								// populate request with group, topic, and all partitions
+								offsetRequest := new(sarama.OffsetFetchRequest)
+								offsetRequest.Version = 1
+								offsetRequest.ConsumerGroup = group
+
+								for p := range partitions {
+									offsetRequest.AddPartition(topic, int32(p))
+								}
+
+								offsetResponse, err := brokers[brokerID].FetchOffset(offsetRequest)
+								if err != nil {
+									log.Errorf("Cannot fetch consumer offsetResponse from broker %v: %v", brokerID, err)
+								}
+
+								// send each (topic, partition, group, offset) to the storage module.
+								// this means burrow starts with a current view of all partitions,
+								// rather than starting at -1 and only discovering the current offset
+								// when the application next commits an offset.
+								for consumedTopic, offsets := range offsetResponse.Blocks {
+									for partition, offset := range offsets {
+										ts := time.Now().Unix() * 1000
+										offset := &protocol.PartitionOffset{
+											Cluster:             client.cluster,
+											Topic:               consumedTopic,
+											Partition:           partition,
+											Group:               group,
+											Offset:              offset.Offset,
+											Timestamp:           ts,
+											TopicPartitionCount: client.topicMap[topic],
+										}
+
+										log.Debugf("OffsetFetchRequest: group: %s topic: %v partition: %v offset: %v (group: %v)", group, consumedTopic, partition, offset.Offset, offset.Group)
+										timeoutSendOffset(client.app.Storage.offsetChannel, offset, 1)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for brokerID, request := range requests {
+		wg.Add(1)
+		go fetchConsumerOffsets(brokerID, request)
+	}
+
+	wg.Wait()
+	client.topicMapLock.RUnlock()
+	return nil
 }
 
 // This function performs massively parallel OffsetRequests, which is better than Sarama's internal implementation,
@@ -329,6 +458,9 @@ func (client *KafkaClient) processConsumerOffsetsMessage(msg *sarama.ConsumerMes
 	}
 
 	// fmt.Printf("[%s,%s,%v]::OffsetAndMetadata[%v,%s,%v]\n", group, topic, partition, offset, metadata, timestamp)
+
+	log.Debugf("__consumer_offsets: group: %s topic: %s partition: %v offset: %v", group, topic, partition, offset)
+
 	partitionOffset := &protocol.PartitionOffset{
 		Cluster:   client.cluster,
 		Topic:     topic,

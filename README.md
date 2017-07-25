@@ -20,15 +20,15 @@ If you have not yet installed the [Go Package Manager](https://github.com/pote/g
 
 ### Build and Install
 ```
-$ go get github.com/linkedin/burrow
-$ cd $GOPATH/src/github.com/linkedin/burrow
+$ go get github.com/linkedin/Burrow
+$ cd $GOPATH/src/github.com/linkedin/Burrow
 $ gpm install
 $ go install
 ```
 
 ### Running Burrow
 ```
-$ $GOPATH/bin/burrow --config path/to/burrow.cfg
+$ $GOPATH/bin/Burrow --config path/to/burrow.cfg
 ```
 
 ### Using Docker
